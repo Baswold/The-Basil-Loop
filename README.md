@@ -2,6 +2,11 @@
 
 A simple, lightweight web interface for chatting with Ollama models.
 
+## 🎥 Demo Video
+
+[![Watch the demo on Vimeo](https://img.shields.io/badge/Demo-Play%20on%20Vimeo-blue?logo=vimeo)](https://vimeo.com/1102758969)
+
+
 ## Project Structure
 
 ```
