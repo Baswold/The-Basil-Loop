@@ -1,3 +1,8 @@
+
+[![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Made with 🧠 by Basil](https://img.shields.io/badge/Made%20by-Basil%20Jackson-brightgreen)](https://github.com/Baswold)
+
+
 # Ollama Chat UI
 
 A simple, lightweight web interface for chatting with Ollama models.
