@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Chat Interface</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header class="header">
+        <h1>AI Chat Interface <span class="beta-badge">BETA v1.0</span></h1>
+        <div class="model-selector">
+            <label for="model-select">Model:</label>
+            <select id="model-select" name="model">
+                <option value="gemma:2b">gemma:2b</option>
+                <option value="codegemma:2b">codegemma:2b</option>
+                <option value="llama3.2:1b">llama3.2:1b</option>
+                <option value="llama3.2:3b">llama3.2:3b</option>
+            </select>
+        </div>
+    </header>
+
+    <main class="main-content">
+        <div id="chat" class="chat-area">
+            <!-- Chat messages will be displayed here -->
+        </div>
+
+        <div class="input-area">
+            <textarea id="prompt" placeholder="Type your message here..." rows="3"></textarea>
+            <div class="button-group">
+                <button id="send-btn" class="send-button">Send</button>
+                <button id="stop-btn" class="stop-button">Stop</button>
+            </div>
+        </div>
+    </main>
+
+    <footer class="status-bar">
+        <div id="status" class="status-text">Ready</div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
