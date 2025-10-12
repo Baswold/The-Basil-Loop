@@ -1,6 +1,281 @@
 // Global variables for user interactions
-let currentModel = 'gemma:2b'; // Default model
+const TEXT_MODEL = 'gemma:2b';
+const CODE_MODEL = 'codegemma:2b';
+const REASONING_MODEL = TEXT_MODEL;
+const CODING_KEYWORD_REGEX = /\b(code|coding|program|programming|function|method|class|module|script|snippet|algorithm|debug|bugfix|sql|query|database|dataset|python|javascript|typescript|java|c\+\+|c#|c\s|rust|go|php|ruby|swift|kotlin|scala|haskell|api|library|sdk|cli|shell|bash|powershell|regex|json|yaml|toml|ini|html|css|markdown|unit test|test case|refactor|implement|compile|build|deploy|docker|kubernetes|makefile|gradle|package\.json)\b/i;
+const CODING_FILE_REGEX = /\b\w+\.(py|js|ts|tsx|jsx|java|c|cpp|cxx|cs|rb|go|rs|php|swift|kt|scala|sql|sh|bash|ps1|json|yaml|yml|toml|ini|html|css|md)\b/i;
+const CODE_FENCE_REGEX = /```|<\/?(script|style|code)[^>]*>/i;
+const FORCE_CODE_MODEL_REGEX = /(use|switch to|prefer|run|pick)\s+(the\s+)?(code|coding)\s+(model|one)|use\s+codegemma/i;
+const FORCE_TEXT_MODEL_REGEX = /(use|switch to|prefer|run|pick)\s+(the\s+)?(text|explanation)\s+(model|one)|use\s+gemma:2b/i;
+const AGENT_LABELS = {
+    tasktype: 'Task routing',
+    model: 'Model selection',
+    prompt: 'Prompt refinement',
+    planning: 'Planning',
+    search: 'Web search',
+    writer: 'Writer draft',
+    direction: 'Direction critique',
+    fact: 'Fact check',
+    checker: 'Completion check',
+    comparison: 'Draft comparison',
+};
+
 let stopRequested = false; // Flag to stop the current loop
+
+function gatherCodingSignals(text = '') {
+    if (!text) {
+        return {
+            keywordMatch: false,
+            hasCodeFence: false,
+            mentionsFile: false,
+        };
+    }
+
+    return {
+        keywordMatch: CODING_KEYWORD_REGEX.test(text),
+        hasCodeFence: CODE_FENCE_REGEX.test(text),
+        mentionsFile: CODING_FILE_REGEX.test(text),
+    };
+}
+
+function detectUserModelPreference(text = '') {
+    if (FORCE_CODE_MODEL_REGEX.test(text)) {
+        return CODE_MODEL;
+    }
+
+    if (FORCE_TEXT_MODEL_REGEX.test(text)) {
+        return TEXT_MODEL;
+    }
+
+    return null;
+}
+
+function normalizeModelChoice(rawDecision = '') {
+    const lower = rawDecision.toLowerCase();
+
+    if (lower.includes('codegemma') || lower.includes('code gemma') || lower.includes('code-model') || lower.includes('code model')) {
+        return CODE_MODEL;
+    }
+
+    if (lower.includes('gemma')) {
+        return TEXT_MODEL;
+    }
+
+    return null;
+}
+
+function summarizeModelHeuristics({ userForcedCode, userForcedText, codingSignals }) {
+    const items = [];
+
+    items.push(`User override: ${userForcedCode ? 'codegemma:2b' : userForcedText ? 'gemma:2b' : 'none'}.`);
+    items.push(`Coding keywords detected: ${codingSignals.keywordMatch ? 'yes' : 'no'}.`);
+    items.push(`Code blocks or markup present: ${codingSignals.hasCodeFence ? 'yes' : 'no'}.`);
+    items.push(`File extensions or language hints: ${codingSignals.mentionsFile ? 'yes' : 'no'}.`);
+
+    return items.map((line) => `- ${line}`).join('\n');
+}
+
+function finalizeModelChoice({ agentProvidedModel, userForcedCode, userForcedText, codingSignals }) {
+    const { keywordMatch, hasCodeFence, mentionsFile } = codingSignals;
+    const codingSignalCount = [keywordMatch, hasCodeFence, mentionsFile].filter(Boolean).length;
+    const strongCodingSignal = codingSignalCount >= 2;
+    const anyCodingSignal = codingSignalCount >= 1;
+
+    if (userForcedCode) {
+        return {
+            model: CODE_MODEL,
+            explanation: 'User explicitly requested the coding model.',
+        };
+    }
+
+    if (userForcedText) {
+        return {
+            model: TEXT_MODEL,
+            explanation: 'User explicitly requested the text model.',
+        };
+    }
+
+    if (agentProvidedModel === CODE_MODEL) {
+        return {
+            model: CODE_MODEL,
+            explanation: 'Model agent selected codegemma:2b for this request.',
+        };
+    }
+
+    if (agentProvidedModel === TEXT_MODEL) {
+        if (strongCodingSignal) {
+            return {
+                model: CODE_MODEL,
+                explanation: 'Model agent leaned toward gemma:2b, but multiple coding signals require codegemma:2b.',
+            };
+        }
+
+        return {
+            model: TEXT_MODEL,
+            explanation: 'Model agent selected gemma:2b for explanatory quality.',
+        };
+    }
+
+    if (strongCodingSignal) {
+        return {
+            model: CODE_MODEL,
+            explanation: 'No clear decision from the agent, defaulting to codegemma:2b because the request looks like code.',
+        };
+    }
+
+    if (anyCodingSignal) {
+        return {
+            model: CODE_MODEL,
+            explanation: 'No clear decision from the agent, but coding cues suggest codegemma:2b will perform better.',
+        };
+    }
+
+    return {
+        model: TEXT_MODEL,
+        explanation: 'No clear decision from the agent, defaulting to gemma:2b for general reasoning.',
+    };
+}
+
+/**
+ * Resolve the correct API endpoint depending on whether the proxy server is used.
+ */
+function resolveApiUrl() {
+    if (typeof window !== 'undefined') {
+        const { hostname, port } = window.location;
+        if (hostname === 'localhost' && port === '3000') {
+            return 'http://localhost:3000/api/generate';
+        }
+    }
+
+    return 'http://localhost:11434/api/generate';
+}
+
+/**
+ * Perform a single non-streaming Ollama completion request.
+ */
+async function requestCompletion({ model, prompt, history = [], signal }) {
+    const response = await fetch(resolveApiUrl(), {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model,
+            prompt,
+            context: history,
+            stream: false,
+        }),
+        signal,
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Stream responses from the Ollama API with shared parsing logic.
+ */
+async function streamResponse({
+    model,
+    prompt,
+    history = [],
+    onChunk,
+    shouldStop,
+    controller,
+}) {
+    const response = await fetch(resolveApiUrl(), {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model,
+            prompt,
+            context: history,
+            stream: true,
+        }),
+        signal: controller?.signal,
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalChunk = null;
+    let aborted = false;
+
+    try {
+        while (true) {
+            if (shouldStop?.()) {
+                await reader.cancel('Stopped by user');
+                if (controller && !controller.signal.aborted) {
+                    controller.abort();
+                }
+                break;
+            }
+
+            const { done, value } = await reader.read();
+
+            if (done) {
+                break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (!trimmedLine) continue;
+
+                try {
+                    const data = JSON.parse(trimmedLine);
+
+                    if (data.response) {
+                        onChunk?.(data.response);
+                    }
+
+                    if (data.done) {
+                        finalChunk = data;
+                    }
+                } catch (parseError) {
+                    console.warn('Failed to parse JSON chunk:', trimmedLine, parseError);
+                }
+            }
+        }
+
+        const remaining = buffer.trim();
+        if (remaining) {
+            try {
+                const data = JSON.parse(remaining);
+                if (data.response) {
+                    onChunk?.(data.response);
+                }
+                if (data.done) {
+                    finalChunk = data;
+                }
+            } catch (parseError) {
+                console.warn('Failed to parse final JSON chunk:', buffer, parseError);
+            }
+        }
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            aborted = true;
+        } else {
+            throw error;
+        }
+    } finally {
+        reader.releaseLock();
+    }
+
+    return aborted ? finalChunk ?? { done: true } : finalChunk;
+}
 
 class OllamaChatUI {
     constructor() {
@@ -8,34 +283,24 @@ class OllamaChatUI {
         this.messageInput = document.getElementById('prompt');
         this.sendButton = document.getElementById('send-btn');
         this.stopButton = document.getElementById('stop-btn');
-        this.modelSelect = document.getElementById('model-select');
         this.statusDiv = document.getElementById('status');
         this.stepCounter = 0;
-        
-        // Use localhost:3000 if using the Express proxy, otherwise direct to Ollama
-        this.apiUrl = window.location.hostname === 'localhost' && window.location.port === '3000' 
-            ? 'http://localhost:3000/api/generate' 
-            : 'http://localhost:11434/api/generate';
-        
+        this.activeController = null;
+
         // Initially hide the stop button
         this.stopButton.style.display = 'none';
-        
-        // Initialize global currentModel with the selected value
-        currentModel = this.modelSelect.value;
-        
+
         this.initializeEventListeners();
         this.addDemoMessages();
+        this.autoResizeInput();
     }
-    
+
     initializeEventListeners() {
         // Send button: disables itself, calls runLoop, re-enables when finished
         this.sendButton.addEventListener('click', () => this.handleSendClick());
         
         // Stop button: sets stopRequested = true so runLoop breaks after current stream
         this.stopButton.addEventListener('click', () => this.handleStopClick());
-        
-        // Model select: updates global currentModel
-        this.modelSelect.addEventListener('change', () => this.handleModelChange());
         
         // Enter key handling
         this.messageInput.addEventListener('keypress', (e) => {
@@ -44,6 +309,9 @@ class OllamaChatUI {
                 this.handleSendClick();
             }
         });
+
+        this.messageInput.addEventListener('input', () => this.autoResizeInput());
+        window.addEventListener('resize', () => this.autoResizeInput());
     }
     
     /**
@@ -67,23 +335,30 @@ class OllamaChatUI {
             // Add user message to chat
             this.addMessage(message, 'user');
             this.messageInput.value = '';
-            
+            this.autoResizeInput();
+
             // Call runLoop with current model and message
-            await this.runLoop(currentModel, message);
+            await this.runLoop(message);
         } catch (error) {
-            console.error('Error in handleSendClick:', error);
-            this.addMessage('Sorry, there was an error processing your request. Please make sure Ollama is running.', 'assistant');
+            if (error.name === 'AbortError') {
+                this.addMessage('Generation stopped.', 'assistant');
+            } else {
+                console.error('Error in handleSendClick:', error);
+                this.addMessage('Sorry, there was an error processing your request. Please make sure Ollama is running.', 'assistant');
+            }
         } finally {
             // Re-enable Send button when finished
             this.sendButton.disabled = false;
             this.sendButton.textContent = 'Send';
-            
+
             // Hide Stop button
             this.stopButton.style.display = 'none';
-            
+            this.stopButton.disabled = false;
+            this.stopButton.textContent = 'Stop';
+
             // Reset stop flag
             stopRequested = false;
-            
+
             this.messageInput.focus();
         }
     }
@@ -96,88 +371,22 @@ class OllamaChatUI {
         this.updateStatus('Stopping after current stream...');
         this.stopButton.disabled = true;
         this.stopButton.textContent = 'Stopping...';
+        this.abortActiveStream();
     }
     
-    /**
-     * Handle Model select change - updates global currentModel
-     */
-    handleModelChange() {
-        currentModel = this.modelSelect.value;
-        this.updateStatus(`Model changed to ${currentModel}`);
-        
-        // Reset status to Ready after a short delay
-        setTimeout(() => {
-            this.updateStatus('Ready');
-        }, 2000);
+    autoResizeInput() {
+        if (!this.messageInput) return;
+
+        const styles = getComputedStyle(this.messageInput);
+        const minHeight = parseFloat(styles.getPropertyValue('--composer-min-height')) || 52;
+        const maxHeight = parseFloat(styles.getPropertyValue('--composer-max-height')) || 320;
+
+        this.messageInput.style.height = 'auto';
+        const desiredHeight = Math.min(Math.max(this.messageInput.scrollHeight, minHeight), maxHeight);
+        this.messageInput.style.height = `${desiredHeight}px`;
+        this.messageInput.style.overflowY = this.messageInput.scrollHeight > maxHeight ? 'auto' : 'hidden';
     }
 
-    async sendMessage() {
-        const message = this.messageInput.value.trim();
-        if (!message) return;
-        
-        // Add user message to chat
-        this.addMessage(message, 'user');
-        this.messageInput.value = '';
-        
-        // Check if this is a loop request (contains keywords like 'loop', 'iterate', 'continue until')
-        const isLoopRequest = message.toLowerCase().includes('loop') || 
-                             message.toLowerCase().includes('iterate') || 
-                             message.toLowerCase().includes('continue until') ||
-                             message.toLowerCase().includes('keep going') ||
-                             message.toLowerCase().includes('step by step');
-        
-        // Disable input while processing
-        this.setInputState(false);
-        
-        try {
-            if (isLoopRequest) {
-                // Use the loop functionality for iterative responses
-                const selectedModel = this.modelSelect.value;
-                await this.runLoop(selectedModel, message);
-            } else {
-                // Regular single response
-                const loadingMessage = this.addMessage('Thinking...', 'assistant', true);
-                
-                const response = await this.callOllama(message);
-                // Remove loading message
-                loadingMessage.remove();
-                // Add assistant response
-                this.addMessage(response, 'assistant');
-            }
-        } catch (error) {
-            console.error('Error:', error);
-            this.addMessage('Sorry, there was an error processing your request. Please make sure Ollama is running.', 'assistant');
-        } finally {
-            this.setInputState(true);
-            this.messageInput.focus();
-        }
-    }
-    
-    async callOllama(message) {
-        const selectedModel = this.modelSelect.value;
-        this.updateStatus(`Connecting to ${selectedModel}...`);
-        
-        const response = await fetch(this.apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: selectedModel,
-                prompt: message,
-                stream: false
-            })
-        });
-        
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        this.updateStatus('Ready');
-        return data.response || 'No response received';
-    }
-    
     /**
      * Streams responses from Ollama API with real-time updates
      * Checks global stopRequested flag during streaming
@@ -188,94 +397,22 @@ class OllamaChatUI {
      * @returns {Promise} - Resolves when streaming is complete or stopped
      */
     async streamOllama(model, prompt, history = [], onChunk) {
-        const response = await fetch(this.apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: model,
-                prompt: prompt,
-                context: history,
-                stream: true
-            })
-        });
-        
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        
+        const controller = new AbortController();
+        this.activeController = controller;
+
         try {
-            while (true) {
-                // Check if stop was requested
-                if (stopRequested) {
-                    break;
-                }
-                
-                const { done, value } = await reader.read();
-                
-                if (done) break;
-                
-                // Decode the chunk and add it to our buffer
-                buffer += decoder.decode(value, { stream: true });
-                
-                // Process complete lines in the buffer
-                let lines = buffer.split('\n');
-                
-                // Keep the last incomplete line in the buffer
-                buffer = lines.pop() || '';
-                
-                // Process each complete line
-                for (const line of lines) {
-                    // Check if stop was requested before processing each line
-                    if (stopRequested) {
-                        break;
-                    }
-                    
-                    const trimmedLine = line.trim();
-                    if (trimmedLine === '') continue;
-                    
-                    try {
-                        const data = JSON.parse(trimmedLine);
-                        
-                        // Extract the response text and call onChunk
-                        if (data.response) {
-                            onChunk(data.response);
-                        }
-                        
-                        // Check if we're done
-                        if (data.done) {
-                            return data;
-                        }
-                    } catch (parseError) {
-                        console.warn('Failed to parse JSON chunk:', trimmedLine, parseError);
-                    }
-                }
-                
-                // Break outer loop if stop was requested during line processing
-                if (stopRequested) {
-                    break;
-                }
-            }
-            
-            // Process any remaining data in the buffer if not stopped
-            if (!stopRequested && buffer.trim()) {
-                try {
-                    const data = JSON.parse(buffer.trim());
-                    if (data.response) {
-                        onChunk(data.response);
-                    }
-                    return data;
-                } catch (parseError) {
-                    console.warn('Failed to parse final JSON chunk:', buffer, parseError);
-                }
-            }
+            return await streamResponse({
+                model,
+                prompt,
+                history,
+                onChunk,
+                shouldStop: () => stopRequested,
+                controller,
+            });
         } finally {
-            reader.releaseLock();
+            if (this.activeController === controller) {
+                this.activeController = null;
+            }
         }
     }
     
@@ -319,42 +456,61 @@ class OllamaChatUI {
         return messageDiv;
     }
     
-    addStepMessage(content, stepNumber = null) {
+    addStepMessage(content, options = {}) {
+        const { label = null } = options;
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message step';
-        
-        // Detect agent type and add specific styling
+
         const agentType = this.detectAgentType(content);
         if (agentType) {
             messageDiv.classList.add(`agent-${agentType}`);
         }
-        
-        if (stepNumber === null) {
-            this.stepCounter++;
-            stepNumber = this.stepCounter;
-        }
-        
-        messageDiv.setAttribute('data-step', `Step ${stepNumber}`);
-        
-        // Render markdown for step messages
+
+        this.stepCounter += 1;
+        const autoLabel = agentType && AGENT_LABELS[agentType]
+            ? `Step ${this.stepCounter} · ${AGENT_LABELS[agentType]}`
+            : `Step ${this.stepCounter}`;
+        messageDiv.setAttribute('data-step', label || autoLabel);
+
+        const body = document.createElement('div');
+        body.className = 'step-body';
         if (typeof marked !== 'undefined') {
-            messageDiv.innerHTML = marked.parse(content);
+            body.innerHTML = marked.parse(content);
         } else {
-            messageDiv.textContent = content;
+            body.textContent = content;
         }
-        
-        // Add copy button for step messages (AI reasoning steps)
+        messageDiv.appendChild(body);
+
         const copyBtn = document.createElement('button');
         copyBtn.className = 'copy-btn';
         copyBtn.innerHTML = '📋';
         copyBtn.title = 'Copy step';
-        copyBtn.addEventListener('click', () => this.copyToClipboard(content, copyBtn));
+        copyBtn.addEventListener('click', () => {
+            const liveContent = body.innerText?.trim() || body.textContent?.trim() || content;
+            this.copyToClipboard(liveContent, copyBtn);
+        });
         messageDiv.appendChild(copyBtn);
-        
+
         this.messagesContainer.appendChild(messageDiv);
         this.scrollToBottom();
-        
+
         return messageDiv;
+    }
+
+    setStepMessageContent(stepElement, content, { markdown = false } = {}) {
+        if (!stepElement) return;
+        const body = stepElement.querySelector('.step-body');
+        if (!body) return;
+
+        if (markdown) {
+            if (typeof marked !== 'undefined') {
+                body.innerHTML = marked.parse(content);
+            } else {
+                body.textContent = content;
+            }
+        } else {
+            body.textContent = content;
+        }
     }
     
     /**
@@ -432,13 +588,19 @@ class OllamaChatUI {
     setInputState(enabled) {
         this.messageInput.disabled = !enabled;
         this.sendButton.disabled = !enabled;
-        
+
         if (enabled) {
             this.sendButton.textContent = 'Send';
             this.updateStatus('Ready');
         } else {
             this.sendButton.textContent = 'Sending...';
             this.updateStatus('Processing...');
+        }
+    }
+
+    abortActiveStream() {
+        if (this.activeController && !this.activeController.signal.aborted) {
+            this.activeController.abort();
         }
     }
     
@@ -454,337 +616,221 @@ class OllamaChatUI {
      * @param {string} userPrompt - The initial user prompt
      * @returns {Promise} - Resolves when loop is stopped
      */
-    async runLoop(model, userPrompt) {
+
+    async runLoop(userPrompt) {
+        this.stepCounter = 0;
         let iteration = 1;
         let currentText = '';
         let searchResults = [];
-        let isCodingTask = false; // Track if this is a coding task
-        
+        let lastImprovementDirections = '';
+        const userPreferredModel = detectUserModelPreference(userPrompt);
+        const userForcedCode = userPreferredModel === CODE_MODEL;
+        const userForcedText = userPreferredModel === TEXT_MODEL;
+        const codingSignals = gatherCodingSignals(userPrompt);
+        let selectedModel = TEXT_MODEL;
+        let isCodingTask = false;
+
         try {
-            // AGENT 0: Task Type Agent (determines if this is coding or text)
-            const taskTypeMessage = this.addStepMessage('TASK TYPE AGENT: Analyzing request type...', `${iteration}-tasktype`);
-            this.updateStatus('Step 0: Determining task type...');
-            
-            let taskType = '';
-            const taskTypePrompt = `You are a Task Type Agent. Analyze if this user request is about coding/programming.
+            const modelStepMessage = this.addStepMessage('MODEL AGENT: Evaluating best model...');
+            this.updateStatus('Step 1: Selecting model...');
 
-User request: "${userPrompt}"
+            let modelDecision = '';
+            const heuristicsSummary = summarizeModelHeuristics({ userForcedCode, userForcedText, codingSignals });
+            const modelSelectionPrompt = `You are a Model Selection Agent. Choose which small model should author the main draft.\n\nUser request: "${userPrompt}"\n\nSystem heuristics:\n${heuristicsSummary}\n\n- ${CODE_MODEL} excels at writing and revising source code but struggles with prose.\n- ${TEXT_MODEL} excels at reasoning, planning, and natural language but is weaker with code.\n\nRespond with ONLY "${CODE_MODEL}" or "${TEXT_MODEL}".`;
 
-Look for keywords like: function, code, program, script, algorithm, implement, debug, syntax, class, method, variable, loop, etc.
-
-Respond with ONLY:
-"code" if this is a coding/programming request
-"text" if this is a general text/explanation request
-
-Nothing else!`;
-            
-            await this.streamOllama(model, taskTypePrompt, [], (chunk) => {
-                if (stopRequested) return;
-                taskType += chunk;
-                taskTypeMessage.textContent = `TASK TYPE AGENT: ${taskType}`;
-            });
-            
-            if (stopRequested) return;
-            
-            isCodingTask = taskType.toLowerCase().trim() === 'code';
-            if (isCodingTask) {
-                taskTypeMessage.innerHTML = marked.parse(`TASK TYPE AGENT: **Detected as CODING task** - Will use codegemma:2b`);
-            } else {
-                taskTypeMessage.innerHTML = marked.parse(`TASK TYPE AGENT: **Detected as TEXT/EXPLANATION task** - Will use gemma:2b`);
-            }
-            
-            // AGENT 1: Prompt Refining Agent (enhances user prompt for better results)
-            const promptStepMessage = this.addStepMessage('PROMPT AGENT: Analyzing and refining user request...', `${iteration}-prompt`);
-            this.updateStatus('Step 1: Refining prompt...');
-            
-            let refinedPrompt = '';
-            const promptRefinePrompt = `You are a Prompt Refining Agent. Your job is to take a user's request and make it more specific and detailed to get the best possible response from other AI agents.
-
-Original user request: "${userPrompt}"
-
-Analyze this request and create a more detailed, specific version that will help other agents provide better technical, scientific, and factual responses. Focus on:
-- Making vague terms more specific
-- Adding context that would be helpful
-- Clarifying the level of detail needed
-- Identifying key aspects to address
-
-Return ONLY the refined prompt, nothing else. No explanations, no "Here's the refined prompt:" - just the improved version.`;
-            
-            await this.streamOllama(model, promptRefinePrompt, [], (chunk) => {
-                if (stopRequested) return;
-                refinedPrompt += chunk;
-                promptStepMessage.textContent = `PROMPT AGENT: ${refinedPrompt}`;
-            });
-            
-            if (stopRequested) return;
-            const finalPrompt = refinedPrompt.trim() || userPrompt; // fallback to original
-            
-            // AGENT 2: Planning Agent (creates execution plan)
-            const planStepMessage = this.addStepMessage('PLANNING AGENT: Creating response strategy...', `${iteration}-plan`);
-            this.updateStatus('Step 2: Planning response...');
-            
-            let responsePlan = '';
-            const planningPrompt = isCodingTask ? 
-                `You are a Planning Agent for CODING tasks. Your job is to create a plan for implementing this code request:
-
-"${finalPrompt}"
-
-Create a coding plan that outlines:
-1. What function/class/module needs to be created
-2. Input parameters and return values
-3. Key algorithms or logic to implement
-4. Error handling considerations
-5. Code structure and organization
-6. Example usage or test cases
-
-Return ONLY the coding plan, nothing else. Be specific and code-focused.` :
-                `You are a Planning Agent. Your job is to create a strategic plan for answering this refined request:
-
-"${finalPrompt}"
-
-Create a detailed plan that outlines:
-1. What main topics need to be covered
-2. What level of technical detail is appropriate
-3. What structure the response should follow
-4. What key points must be addressed
-5. What tools or knowledge areas to focus on
-
-Return ONLY the plan, nothing else. Be specific and actionable.`;
-            
-            await this.streamOllama(model, planningPrompt, [], (chunk) => {
-                if (stopRequested) return;
-                responsePlan += chunk;
-                planStepMessage.textContent = `PLANNING AGENT: ${responsePlan}`;
-            });
-            
-            if (stopRequested) return;
-            
-            // AGENT 3: Model Selection Agent (picks best model for the task)
-            const modelStepMessage = this.addStepMessage('MODEL AGENT: Selecting optimal model for this task...', `${iteration}-model`);
-            this.updateStatus('Step 3: Selecting model...');
-            
-            let selectedModel = model; // default fallback
-            
-            // Skip model selection agent if task type already determined
-            if (isCodingTask) {
-                selectedModel = 'codegemma:2b';
-                modelStepMessage.innerHTML = marked.parse(`MODEL AGENT: **Automatically selected codegemma:2b** based on Task Type Agent's coding detection`);
-            } else {
-                let modelDecision = '';
-                const modelSelectionPrompt = `You are a Model Selection Agent. Your job is to determine whether to use gemma:2b (good for text/explanations) or codegemma:2b (specialized for code) based on the request.
-
-Request to analyze: "${finalPrompt}"
-Planning context: ${responsePlan}
-
-Analyze if this request is primarily about:
-- CODE/PROGRAMMING (functions, algorithms, debugging, syntax, code examples, programming concepts) → use codegemma:2b
-- TEXT/EXPLANATIONS (concepts, theories, general knowledge, essays, explanations) → use gemma:2b
-
-IMPORTANT: codegemma:2b is TERRIBLE at writing explanatory text but excellent at code. gemma:2b is good at explanations but weaker at code.
-
-Respond with ONLY:
-"codegemma:2b" if this is primarily a coding/programming task
-"gemma:2b" if this is primarily a text/explanation task
-
-Nothing else!`;
-            
-            await this.streamOllama(model, modelSelectionPrompt, [], (chunk) => {
+            await this.streamOllama(REASONING_MODEL, modelSelectionPrompt, [], (chunk) => {
                 if (stopRequested) return;
                 modelDecision += chunk;
-                modelStepMessage.textContent = `MODEL AGENT: ${modelDecision}`;
+                this.setStepMessageContent(modelStepMessage, `MODEL AGENT: ${modelDecision}`);
             });
-            
+
             if (stopRequested) return;
-            
-                // Parse model decision
-                const cleanDecision = modelDecision.toLowerCase().trim();
-                if (cleanDecision.includes('codegemma:2b')) {
-                    selectedModel = 'codegemma:2b';
-                    modelStepMessage.innerHTML = marked.parse(`MODEL AGENT: Selected **codegemma:2b** - This is a coding/programming task`);
-                } else {
-                    selectedModel = 'gemma:2b';
-                    modelStepMessage.innerHTML = marked.parse(`MODEL AGENT: Selected **gemma:2b** - This is a text/explanation task`);
-                }
-            }
-            
-            // AGENT 4: Web Search (if needed)
+
+            const agentProvidedModel = normalizeModelChoice(modelDecision.trim());
+            const { model: resolvedModel, explanation: modelExplanation } = finalizeModelChoice({
+                agentProvidedModel,
+                userForcedCode,
+                userForcedText,
+                codingSignals,
+            });
+            selectedModel = resolvedModel;
+            isCodingTask = selectedModel === CODE_MODEL;
+
+            const decisionDisplay = modelDecision.trim() || 'No explicit answer returned.';
+            this.setStepMessageContent(
+                modelStepMessage,
+                `MODEL AGENT: ${decisionDisplay}\n\n**Selected:** **${selectedModel}**. ${modelExplanation}`,
+                { markdown: true }
+            );
+
+            const promptStepMessage = this.addStepMessage('PROMPT AGENT: Refining user request...');
+            this.updateStatus('Step 2: Refining prompt...');
+
+            let refinedPrompt = '';
+            const promptRefinePrompt = `You are a Prompt Refining Agent. Your job is to take a user's request and make it more specific and detailed to get the best possible response from other AI agents.\n\nOriginal user request: "${userPrompt}"\n\nAnalyze this request and create a more detailed, specific version that will help other agents provide better technical, scientific, and factual responses. Focus on:\n- Making vague terms more specific\n- Adding context that would be helpful\n- Clarifying the level of detail needed\n- Identifying key aspects to address\n\nReturn ONLY the refined prompt, nothing else. No explanations, no "Here's the refined prompt:" - just the improved version.`;
+
+            await this.streamOllama(REASONING_MODEL, promptRefinePrompt, [], (chunk) => {
+                if (stopRequested) return;
+                refinedPrompt += chunk;
+                this.setStepMessageContent(promptStepMessage, `PROMPT AGENT: ${refinedPrompt}`);
+            });
+
+            if (stopRequested) return;
+            const finalPrompt = refinedPrompt.trim() || userPrompt;
+
+            const planStepMessage = this.addStepMessage('PLANNING AGENT: Creating response strategy...');
+            this.updateStatus('Step 3: Planning response...');
+
+            let responsePlan = '';
+            const planningPrompt = isCodingTask
+                ? `You are a Planning Agent for CODING tasks. Your job is to create a plan for implementing this code request:\n\n"${finalPrompt}"\n\nCreate a coding plan that outlines:\n1. What function/class/module needs to be created\n2. Input parameters and return values\n3. Key algorithms or logic to implement\n4. Error handling considerations\n5. Code structure and organization\n6. Example usage or test cases\n\nReturn ONLY the coding plan, nothing else. Be specific and code-focused.`
+                : `You are a Planning Agent. Your job is to create a strategic plan for answering this refined request:\n\n"${finalPrompt}"\n\nCreate a detailed plan that outlines:\n1. What main topics need to be covered\n2. What level of technical detail is appropriate\n3. What structure the response should follow\n4. What key points must be addressed\n5. What tools or knowledge areas to focus on\n\nReturn ONLY the plan, nothing else. Be specific and actionable.`;
+
+            await this.streamOllama(REASONING_MODEL, planningPrompt, [], (chunk) => {
+                if (stopRequested) return;
+                responsePlan += chunk;
+                this.setStepMessageContent(planStepMessage, `PLANNING AGENT: ${responsePlan}`);
+            });
+
+            if (stopRequested) return;
+
             const shouldSearchNow = this.shouldSearch(finalPrompt);
             if (shouldSearchNow) {
-                const searchStepMessage = this.addStepMessage('SEARCH AGENT: Gathering current information...', `${iteration}-search`);
+                const searchStepMessage = this.addStepMessage('SEARCH AGENT: Gathering current information...');
                 this.updateStatus('Step 4: Searching web...');
-                
+
                 try {
                     searchResults = await this.performSearch(finalPrompt);
                     if (searchResults.length > 0) {
-                        let searchSummary = 'SEARCH AGENT: Found relevant information:\n\n';
+                        let searchSummary = 'SEARCH AGENT: Found relevant information:\\n\\n';
                         searchResults.forEach((result, index) => {
-                            searchSummary += `**${index + 1}. ${result.title}** (${result.source})\n`;
-                            searchSummary += `${result.snippet}\n`;
+                            searchSummary += `**${index + 1}. ${result.title}** (${result.source})\\n`;
+                            searchSummary += `${result.snippet}\\n`;
                             if (result.url) {
-                                searchSummary += `[Source: ${result.url}]\n`;
+                                searchSummary += `[Source: ${result.url}]\\n`;
                             }
-                            searchSummary += '\n';
+                            searchSummary += '\\n';
                         });
-                        searchStepMessage.innerHTML = marked.parse(searchSummary);
+                        this.setStepMessageContent(searchStepMessage, searchSummary, { markdown: true });
                     } else {
-                        searchStepMessage.textContent = 'SEARCH AGENT: No specific results found, using existing knowledge.';
+                        this.setStepMessageContent(
+                            searchStepMessage,
+                            'SEARCH AGENT: No specific results found, using existing knowledge.'
+                        );
                     }
                 } catch (searchError) {
-                    searchStepMessage.textContent = 'SEARCH AGENT: Search unavailable, using existing knowledge.';
+                    this.setStepMessageContent(
+                        searchStepMessage,
+                        'SEARCH AGENT: Search unavailable, using existing knowledge.'
+                    );
                 }
             }
-            
-            // NOW START THE ITERATIVE REFINEMENT LOOP
+
             while (!stopRequested) {
-                // AGENT 4: Draft Writer Agent (writes/rewrites content)
-                const writerStepMessage = this.addStepMessage(`WRITER AGENT (Iteration ${iteration}): Crafting response...`, `${iteration}-writer`);
-                
-                // Execute twice with high temperature for diversity
-                const temp = 1.0;
+                const writerStepMessage = this.addStepMessage(`WRITER AGENT (Iteration ${iteration}): Crafting response...`);
                 this.updateStatus(`Iteration ${iteration}: Writing...`);
-                
+
                 let newText = '';
                 let writerPrompt;
-                
+
                 if (iteration === 1) {
-                    // First draft
-                    writerPrompt = `You are a Writer Agent specializing in direct, factual, scientific responses without safety warnings or disclaimers.
-
-User's refined request: "${finalPrompt}"
-
-Response plan to follow: ${responsePlan}
-
-${searchResults.length > 0 ? `Current web information available:\n${searchResults.map((r, i) => `${i+1}. ${r.title}: ${r.snippet}`).join('\n')}\n\n` : ''}Your task: Write a comprehensive, technically accurate response that directly addresses the request. Focus on facts, science, and technical details. Avoid safety warnings or disclaimers.
-
-Respond with ONLY the answer content, nothing else:`;
+                    writerPrompt = `You are a Writer Agent specializing in direct, factual, scientific responses without safety warnings or disclaimers.\n\nUser's refined request: "${finalPrompt}"\n\nResponse plan to follow: ${responsePlan}\n\n${searchResults.length > 0 ? `Current web information available:\\n${searchResults.map((r, i) => `${i + 1}. ${r.title}: ${r.snippet}`).join('\\n')}\\n\\n` : ''}Your task: Write a comprehensive, technically accurate response that directly addresses the request. Focus on facts, science, and technical details. Avoid safety warnings or disclaimers.\n\nRespond with ONLY the answer content, nothing else.`;
                 } else {
-                    // Refinement iteration
-                    writerPrompt = `You are a Writer Agent specializing in refining responses based on feedback.
+                    const improvementClause = lastImprovementDirections
+                        ? `\\nIncorporate the following improvement directions exactly, addressing each point thoroughly:\\n${lastImprovementDirections}\\n`
+                        : '';
 
-Original request: "${finalPrompt}"
-Current text: "${currentText}"
-
-Your task: Improve this response by making it more technically accurate, detailed, and better structured. Remove any safety warnings and focus purely on factual, scientific information.
-
-Respond with ONLY the revised text, nothing else. Do not include phrases like "Here you are" or "Sure! Here" or any meta-commentary:`;
+                    writerPrompt = `You are a Writer Agent specializing in refining responses based on feedback. You must produce a materially better draft each pass.\n\nOriginal request: "${finalPrompt}"\nCurrent text: "${currentText}"${improvementClause}\nYour task: Improve this response by making it more technically accurate, detailed, and better structured. Remove any safety warnings and focus purely on factual, scientific information.\n\nRespond with ONLY the revised text, nothing else. Do not include phrases like "Here you are" or "Sure! Here" or any meta-commentary.`;
                 }
-                
+
                 await this.streamOllama(selectedModel, writerPrompt, [], (chunk) => {
                     if (stopRequested) return;
                     newText += chunk;
-                    writerStepMessage.textContent = `WRITER AGENT: ${newText}`;
+                    this.setStepMessageContent(writerStepMessage, `WRITER AGENT: ${newText}`);
                 });
-                
+
                 if (stopRequested) break;
                 currentText = newText.trim();
-                
-                
-                // Perform a second iteration
+
                 let secondText = '';
                 await this.streamOllama(selectedModel, writerPrompt, [], (chunk) => {
                     if (stopRequested) return;
                     secondText += chunk;
                 });
-                
-                if (stopRequested) break;
-                
-                // AGENT: Comparison Agent (compares two responses)
-                const comparisonStepMessage = this.addStepMessage(`COMPARISON AGENT (Iteration ${iteration}): Comparing responses...`, `${iteration}-comparison`);
-                this.updateStatus(`Iteration ${iteration}: Comparing...`);
-                
-                let comparisonDecision = '';
-                const comparisonPrompt = `You are a Comparison Agent. Your job is to decide which response is better in terms of clarity, detail, and accuracy.
-                
-                Response 1: "${newText.trim()}"
-                Response 2: "${secondText.trim()}"
-                
-                Decide which response is superior in quality.
-                
-                Respond with ONLY:
-                - "1" if Response 1 is better
-                - "2" if Response 2 is better
-                Nothing else!`;
 
-                await this.streamOllama(model, comparisonPrompt, [], (chunk) => {
+                if (stopRequested) break;
+
+                const comparisonStepMessage = this.addStepMessage(`COMPARISON AGENT (Iteration ${iteration}): Comparing responses...`);
+                this.updateStatus(`Iteration ${iteration}: Comparing...`);
+
+                let comparisonDecision = '';
+                const comparisonPrompt = `You are a Comparison Agent. Your job is to decide which response is better in terms of clarity, detail, and accuracy.\n\nResponse 1: "${newText.trim()}"\nResponse 2: "${secondText.trim()}"\n\nDecide which response is superior in quality.\n\nRespond with ONLY:\n- "1" if Response 1 is better\n- "2" if Response 2 is better\nNothing else!`;
+
+                await this.streamOllama(REASONING_MODEL, comparisonPrompt, [], (chunk) => {
                     if (stopRequested) return;
                     comparisonDecision += chunk;
-                    comparisonStepMessage.textContent = `COMPARISON AGENT: ${comparisonDecision}`;
+                    this.setStepMessageContent(comparisonStepMessage, `COMPARISON AGENT: ${comparisonDecision}`);
                 });
 
                 if (stopRequested) break;
 
                 const isFirstBetter = comparisonDecision.trim() === '1';
                 currentText = isFirstBetter ? newText.trim() : secondText.trim();
-                const directionStepMessage = this.addStepMessage(`DIRECTION AGENT (Iteration ${iteration}): Analyzing for improvements...`, `${iteration}-direction`);
+
+                const directionStepMessage = this.addStepMessage(`DIRECTION AGENT (Iteration ${iteration}): Analyzing for improvements...`);
                 this.updateStatus(`Iteration ${iteration}: Analyzing...`);
-                
+
                 let improvementDirection = '';
-                const directionPrompt = `You are a Refinement Direction Agent. Your job is to analyze responses and provide specific improvement directions.
+                const directionPrompt = `You are a Refinement Direction Agent. Your job is to analyze responses and provide specific improvement directions.\n\nOriginal request: "${finalPrompt}"\nCurrent response: "${currentText}"\n\nAnalyze this response and provide specific directions for improvement. Focus on:\n- Technical accuracy and detail\n- Completeness of coverage\n- Clarity and structure\n- Factual precision\n- Areas that need more depth\n\nReturn ONLY specific improvement directions, nothing else. Be direct and actionable.`;
 
-Original request: "${finalPrompt}"
-Current response: "${currentText}"
-
-Analyze this response and provide specific directions for improvement. Focus on:
-- Technical accuracy and detail
-- Completeness of coverage
-- Clarity and structure
-- Factual precision
-- Areas that need more depth
-
-Return ONLY specific improvement directions, nothing else. Be direct and actionable.`;
-                
-                await this.streamOllama(model, directionPrompt, [], (chunk) => {
+                await this.streamOllama(REASONING_MODEL, directionPrompt, [], (chunk) => {
                     if (stopRequested) return;
                     improvementDirection += chunk;
-                    directionStepMessage.textContent = `DIRECTION AGENT: ${improvementDirection}`;
+                    this.setStepMessageContent(directionStepMessage, `DIRECTION AGENT: ${improvementDirection}`);
                 });
-                
+
                 if (stopRequested) break;
-                
-                // AGENT 6: Refinement Checker Agent (decides if we're done)
-                const checkerStepMessage = this.addStepMessage(`CHECKER AGENT (Iteration ${iteration}): Evaluating completion...`, `${iteration}-checker`);
+
+                const trimmedDirections = improvementDirection.trim();
+                if (trimmedDirections) {
+                    lastImprovementDirections = trimmedDirections;
+                    this.setStepMessageContent(directionStepMessage, `DIRECTION AGENT: ${trimmedDirections}`, {
+                        markdown: true,
+                    });
+                } else {
+                    const fallbackDirection = 'DIRECTION AGENT: No explicit revisions returned. Default to: increase factual depth, ensure every plan bullet is covered, tighten structure, and remove repetition.';
+                    lastImprovementDirections = 'Increase factual depth, ensure every plan bullet is covered, tighten structure, and remove repetition.';
+                    this.setStepMessageContent(directionStepMessage, fallbackDirection, { markdown: true });
+                }
+
+                const directionsForChecker = lastImprovementDirections || improvementDirection.trim();
+                const checkerStepMessage = this.addStepMessage(`CHECKER AGENT (Iteration ${iteration}): Evaluating completion...`);
                 this.updateStatus(`Iteration ${iteration}: Checking completion...`);
-                
+
                 let checkerDecision = '';
-                const checkerPrompt = `You are a Refinement Checker Agent. Your job is to decide if a response is complete and high-quality enough.
+                const checkerPrompt = `You are a Refinement Checker Agent. Your job is to decide if a response is complete and high-quality enough.\n\nOriginal request: "${finalPrompt}"\nCurrent response: "${currentText}"\nImprovement directions noted: "${directionsForChecker || 'Strengthen clarity, coverage, and technical precision.'}"\n\nEvaluate if this response fully and excellently addresses the original request with sufficient technical detail and accuracy.\n\nRespond with ONLY:\n- "No" if it needs refinement (be strict about quality)\n- "Yes" if it's comprehensive and excellent\n\nThat's it. Just "Yes" or "No", nothing else.`;
 
-Original request: "${finalPrompt}"
-Current response: "${currentText}"
-Improvement directions noted: "${improvementDirection}"
-
-Evaluate if this response fully and excellently addresses the original request with sufficient technical detail and accuracy.
-
-Respond with ONLY:
-- "No" if it needs refinement (be strict about quality)
-- "Yes" if it's comprehensive and excellent
-
-That's it. Just "Yes" or "No", nothing else.`;
-                
-                await this.streamOllama(model, checkerPrompt, [], (chunk) => {
+                await this.streamOllama(REASONING_MODEL, checkerPrompt, [], (chunk) => {
                     if (stopRequested) return;
                     checkerDecision += chunk;
-                    checkerStepMessage.textContent = `CHECKER AGENT: ${checkerDecision}`;
+                    this.setStepMessageContent(checkerStepMessage, `CHECKER AGENT: ${checkerDecision}`);
                 });
-                
+
                 if (stopRequested) break;
-                
-                // Check the decision
+
                 const decision = checkerDecision.toLowerCase().trim();
                 const isComplete = decision === 'yes' || decision.startsWith('yes');
-                
+
                 if (isComplete) {
-                    // Submit final answer
                     this.addMessage(currentText, 'assistant');
                     this.updateStatus(`✅ Completed after ${iteration} iterations. Checker Agent approved the result.`);
                     break;
                 } else {
-                    // Continue refining
-                    const continueMessage = this.addStepMessage(`🔄 Checker Agent says "No" - continuing refinement...`, `${iteration}-continue`);
+                    this.addStepMessage(`🔄 Checker Agent says "No" - continuing refinement...`);
                     iteration++;
-                    
-                    // Small delay between iterations
+
                     if (!stopRequested) {
-                        await new Promise(resolve => {
+                        await new Promise((resolve) => {
                             const timeout = setTimeout(resolve, 1000);
                             if (stopRequested) {
                                 clearTimeout(timeout);
@@ -792,8 +838,7 @@ That's it. Just "Yes" or "No", nothing else.`;
                             }
                         });
                     }
-                    
-                    // Safety check - prevent infinite loops
+
                     if (iteration > 20) {
                         this.addMessage(currentText, 'assistant');
                         this.updateStatus(`⚠️ Reached maximum iterations (20). Submitting current version.`);
@@ -801,18 +846,21 @@ That's it. Just "Yes" or "No", nothing else.`;
                     }
                 }
             }
-            
+
         } catch (error) {
-            console.error('Error in Basil Loop:', error);
-            this.addStepMessage(`❌ Error: ${error.message}`, 'error');
-            if (currentText) {
-                this.addMessage(currentText, 'assistant');
+            if (error.name === 'AbortError' || stopRequested) {
+                console.info('Basil Loop stopped by user.');
+            } else {
+                console.error('Error in Basil Loop:', error);
+                this.addStepMessage(`❌ Error: ${error.message}`, { label: 'Error' });
+                if (currentText) {
+                    this.addMessage(currentText, 'assistant');
+                }
             }
         } finally {
-            // Clean up UI state
             this.stopButton.disabled = false;
             this.stopButton.textContent = 'Stop';
-            
+
             if (stopRequested) {
                 this.updateStatus('🛑 Loop stopped by user.');
                 if (currentText) {
@@ -821,7 +869,6 @@ That's it. Just "Yes" or "No", nothing else.`;
             }
         }
     }
-    
     /**
      * Determine if a query should trigger a web search
      */
@@ -896,171 +943,87 @@ That's it. Just "Yes" or "No", nothing else.`;
     }
 }
 
+
 /**
  * Standalone runLoop function as specified in the requirements
  * Creates unlimited iterative loop logic
- * @param {string} model - The model to use for generation
  * @param {string} userPrompt - The initial user prompt
  * @returns {Promise} - Resolves when loop is stopped
  */
-async function runLoop(model, userPrompt) {
+async function runLoop(userPrompt) {
+    if (typeof window !== 'undefined' && window.chatUI) {
+        return window.chatUI.runLoop(userPrompt);
+    }
+
+    const userPreferredModel = detectUserModelPreference(userPrompt);
+    const userForcedCode = userPreferredModel === CODE_MODEL;
+    const userForcedText = userPreferredModel === TEXT_MODEL;
+    const codingSignals = gatherCodingSignals(userPrompt);
+    const heuristicsSummary = summarizeModelHeuristics({ userForcedCode, userForcedText, codingSignals });
+
+    let modelDecision = '';
+    try {
+        await streamResponse({
+            model: REASONING_MODEL,
+            prompt: `You are a Model Selection Agent. Choose which small model should author the main draft.\n\nUser request: "${userPrompt}"\n\nSystem heuristics:\n${heuristicsSummary}\n\n- ${CODE_MODEL} excels at writing and revising source code but struggles with prose.\n- ${TEXT_MODEL} excels at reasoning, planning, and natural language but is weaker with code.\n\nRespond with ONLY "${CODE_MODEL}" or "${TEXT_MODEL}".`,
+            history: [],
+            onChunk: (chunk) => {
+                modelDecision += chunk;
+                console.log(`MODEL AGENT: ${modelDecision}`);
+            },
+            shouldStop: () => stopRequested,
+        });
+    } catch (error) {
+        if (error.name !== 'AbortError') {
+            throw error;
+        }
+    }
+
+    const agentProvidedModel = normalizeModelChoice(modelDecision.trim());
+    const { model: selectedModel } = finalizeModelChoice({
+        agentProvidedModel,
+        userForcedCode,
+        userForcedText,
+        codingSignals,
+    });
+
+    console.log(`MODEL AGENT FINAL: ${selectedModel}`);
+
     const history = [];
     let loop = 1;
-    
+
     while (true) {
-        // a. Display "Step #loop" placeholder
         console.log(`Step ${loop}`);
-        
-        // Create a placeholder element in the DOM if chat UI is available
-        if (typeof window !== 'undefined' && document.getElementById('chat')) {
-            const chatArea = document.getElementById('chat');
-            const stepDiv = document.createElement('div');
-            stepDiv.className = 'message step';
-            stepDiv.setAttribute('data-step', `Step ${loop}`);
-            stepDiv.textContent = 'Starting...';
-            chatArea.appendChild(stepDiv);
-            
-            let stepContent = '';
-            
-            try {
-                // b. Await streamOllama(...), appending tokens to that step
-                // Use proxy URL if running on localhost:3000, otherwise direct to Ollama
-                const apiUrl = window.location.hostname === 'localhost' && window.location.port === '3000' 
-                    ? 'http://localhost:3000/api/generate' 
-                    : 'http://localhost:11434/api/generate';
-                const response = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        model: model,
-                        prompt: loop === 1 ? userPrompt : 'continue',
-                        context: history,
-                        stream: true
-                    })
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-                
-                while (true) {
-                    const { done, value } = await reader.read();
-                    
-                    if (done) break;
-                    
-                    buffer += decoder.decode(value, { stream: true });
-                    let lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-                    
-                    for (const line of lines) {
-                        const trimmedLine = line.trim();
-                        if (trimmedLine === '') continue;
-                        
-                        try {
-                            const data = JSON.parse(trimmedLine);
-                            
-                            if (data.response) {
-                                stepContent += data.response;
-                                stepDiv.textContent = stepContent; // Update step with streaming content
-                            }
-                            
-                            if (data.done) {
-                                break;
-                            }
-                        } catch (parseError) {
-                            console.warn('Failed to parse JSON chunk:', trimmedLine);
-                        }
-                    }
-                }
-                
-                // Process remaining buffer
-                if (buffer.trim()) {
-                    try {
-                        const data = JSON.parse(buffer.trim());
-                        if (data.response) {
-                            stepContent += data.response;
-                            stepDiv.textContent = stepContent;
-                        }
-                    } catch (parseError) {
-                        console.warn('Failed to parse final JSON chunk:', buffer);
-                    }
-                }
-                
-                // c. Decide continue or stop
-                const lowerContent = stepContent.toLowerCase();
-                if (lowerContent.includes('done') || 
-                    lowerContent.includes('finished') || 
-                    lowerContent.includes('complete')) {
-                    console.log('AI indicated completion. Stopping loop.');
-                    break;
-                }
-                
-                // Push AI text into history
-                if (stepContent.trim()) {
-                    history.push(stepContent);
-                }
-                
-            } catch (error) {
-                console.error(`Error in step ${loop}:`, error);
-                stepDiv.textContent = `Error in step ${loop}: ${error.message}`;
-                stepDiv.classList.add('error');
+
+        try {
+            const data = await requestCompletion({
+                model: selectedModel,
+                prompt: loop === 1 ? userPrompt : 'continue',
+                history,
+            });
+            const content = data.response || '';
+            console.log(`Step ${loop} response:`, content);
+
+            if (content.toLowerCase().includes('done') ||
+                content.toLowerCase().includes('finished') ||
+                content.toLowerCase().includes('complete')) {
+                console.log('AI indicated completion. Stopping loop.');
+                break;
             }
-            
-            // Small delay between iterations
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-        } else {
-            // Fallback for non-DOM environments
-            console.warn('DOM not available, running in console mode');
-            
-            try {
-                // Use proxy URL if running on localhost:3000, otherwise direct to Ollama
-                const apiUrl = window.location.hostname === 'localhost' && window.location.port === '3000' 
-                    ? 'http://localhost:3000/api/generate' 
-                    : 'http://localhost:11434/api/generate';
-                const response = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        model: model,
-                        prompt: loop === 1 ? userPrompt : 'continue',
-                        context: history,
-                        stream: false
-                    })
-                });
-                
-                const data = await response.json();
-                const content = data.response || '';
-                console.log(`Step ${loop} response:`, content);
-                
-                if (content.toLowerCase().includes('done')) {
-                    break;
-                }
-                
-                history.push(content);
-                
-            } catch (error) {
-                console.error(`Error in step ${loop}:`, error);
-            }
+
+            history.push(content);
+        } catch (error) {
+            console.error(`Error in step ${loop}:`, error);
         }
-        
+
         loop++;
-        
-        // Safety check to prevent infinite loops
+
         if (loop > 100) {
             console.log('Reached maximum iterations (100). Stopping for safety.');
             break;
         }
     }
-    
+
     return history;
 }
 
@@ -1070,6 +1033,5 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Make runLoop function and global variables available
     window.runLoop = runLoop;
-    window.currentModel = currentModel;
     window.stopRequested = stopRequested;
 });
